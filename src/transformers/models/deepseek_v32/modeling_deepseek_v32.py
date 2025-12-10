@@ -238,8 +238,16 @@ class DeepseekV32TopkRouter(nn.Module):
 class DeepseekV32NaiveMoe(nn.Module):
     """Collection of expert weights stored as 3D tensors.
 
-    This overrides the parent MixtralExperts forward method to use consistent device
-    placement for gradient checkpointing compatibility with use_reentrant=True.
+    This implementation ensures gradient checkpointing compatibility with `use_reentrant=True`
+    through two mechanisms:
+
+    1. **Consistent device placement**: Uses `target_device = hidden_states.device` for all
+       tensor operations instead of per-token device placement.
+
+    2. **Cached routing decisions**: Pre-computes and caches expert-to-token assignments
+       during forward pass. Since routing is computed under `torch.no_grad()` (non-differentiable),
+       caching is mathematically equivalent and ensures identical routing during backward
+       recomputation for gradient checkpointing.
     """
 
     def __init__(self, config):
@@ -251,6 +259,38 @@ class DeepseekV32NaiveMoe(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
 
+    def _compute_expert_assignments(
+        self,
+        top_k_index: torch.Tensor,
+        target_device: torch.device,
+    ) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+        """Compute expert-to-token assignments.
+
+        Returns a list of (expert_idx, top_k_pos, token_idx) tuples for each active expert.
+        This is computed under torch.no_grad() and can be safely cached for gradient checkpointing.
+        """
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+            assignments = []
+            for expert_idx in expert_hit:
+                expert_idx_val = expert_idx[0].item()
+                if expert_idx_val == self.num_experts:
+                    continue
+                top_k_pos, token_idx = torch.where(expert_mask[expert_idx_val])
+                # Move indices to target device for consistency
+                assignments.append(
+                    (
+                        expert_idx_val,
+                        top_k_pos.to(target_device),
+                        token_idx.to(target_device),
+                    )
+                )
+
+        return assignments
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -260,26 +300,17 @@ class DeepseekV32NaiveMoe(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states)
 
         # Use consistent device from input tensor for gradient checkpointing compatibility.
-        # During recomputation, per-token device placement may vary, but the input tensor's
-        # device remains stable. This ensures deterministic tensor metadata for use_reentrant=True.
         target_device = hidden_states.device
 
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        # Compute expert assignments - this is non-differentiable (under no_grad)
+        # and deterministic given the same top_k_index, ensuring gradient checkpointing works.
+        assignments = self._compute_expert_assignments(top_k_index, target_device)
 
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            # Use target_device (input device) instead of current_state.device for
-            # deterministic device placement during gradient checkpointing recomputation
+        for expert_idx, top_k_pos, token_idx in assignments:
+            current_state = hidden_states[token_idx].to(target_device)
             gate_up_weight = self.gate_up_proj[expert_idx].to(target_device)
             down_weight = self.down_proj[expert_idx].to(target_device)
-            current_state = current_state.to(target_device)
+
             gate, up = nn.functional.linear(current_state, gate_up_weight).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = nn.functional.linear(current_hidden_states, down_weight)
