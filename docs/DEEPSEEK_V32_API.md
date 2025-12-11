@@ -5,7 +5,7 @@ This document describes the **capabilities and API** exposed by the DeepSeek V3.
 ## Installation
 
 ```bash
-pip install git+https://github.com/lyfegame/transformers.git@shuyingl/deepseek-v3.2-test
+pip install git+https://github.com/lyfegame/transformers.git@shuyingl/v32-occam-cleanup
 pip install fast-hadamard-transform  # Optional but recommended for performance
 ```
 
@@ -346,6 +346,54 @@ The target distribution `p_{t,:}` is computed per the tech report:
 
 When `config.indexer_kl_coef > 0`, both `I_{t,s}` and `p_{t,:}` are computed automatically during the forward pass and used to compute `outputs.indexer_kl_loss`.
 
+### Lightning Indexer Weight Scaling
+
+The indexer weights are scaled according to the official DeepSeek implementation:
+
+```
+weights = weights_proj(hidden_states) * n_heads^{-0.5} * softmax_scale
+```
+
+Where `softmax_scale = head_dim^{-0.5}`. The official inference code also includes a `q_scale` factor for FP8 quantization, which is omitted in this training implementation (FP8-specific).
+
+### Two-Stage Training Protocol (per Tech Report)
+
+The implementation follows the DeepSeek V3.2 technical report's two-stage training protocol:
+
+**Stage 1: Dense Warm-up (Indexer Training with Dense Attention)**
+
+Train the indexer to match dense attention distribution. The main model is frozen, only indexer parameters are updated.
+
+```python
+# Freeze main model, train only indexer
+for name, param in model.named_parameters():
+    param.requires_grad = "indexer" in name
+
+model.config.use_sparse_attention = False  # Use dense attention
+model.config.indexer_kl_coef = 1.0  # Train indexer with KL loss only
+
+outputs = model(input_ids, labels=labels)
+loss = outputs.indexer_kl_loss  # Only optimize indexer
+loss.backward()
+```
+
+**Stage 2: Sparse Training (Joint Model + Indexer Training)**
+
+Train both model and indexer with sparse attention. The KL target comes from the sparse attention distribution.
+
+```python
+# Unfreeze all parameters
+for param in model.parameters():
+    param.requires_grad = True
+
+model.config.use_sparse_attention = True  # Use sparse attention
+model.config.indexer_kl_coef = 0.1  # Small KL coefficient
+
+outputs = model(input_ids, labels=labels)
+loss = outputs.loss  # lm_loss + 0.1 * indexer_kl_loss
+loss.backward()
+```
+
 ### Two Exposed Losses for LoRA Integration
 
 The implementation exposes **separate losses** for flexible training:
@@ -365,22 +413,20 @@ The implementation exposes **separate losses** for flexible training:
    loss = outputs.loss  # Same as outputs.lm_loss when indexer_kl_coef=0
    ```
 
-2. **Indexer training only** (per tech report warm-up):
+2. **Dense warm-up** (per tech report Stage 1):
    ```python
+   model.config.use_sparse_attention = False
    model.config.indexer_kl_coef = 1.0
    outputs = model(input_ids, labels=labels)
    kl_loss = outputs.indexer_kl_loss
    ```
 
-3. **Joint training** (main model + indexer LoRA):
+3. **Joint sparse training** (per tech report Stage 2):
    ```python
-   # Option A: Use combined loss with config
+   model.config.use_sparse_attention = True
    model.config.indexer_kl_coef = 0.1
    outputs = model(input_ids, labels=labels)
    loss = outputs.loss  # lm_loss + 0.1 * indexer_kl_loss
-
-   # Option B: Manual combination
-   loss = outputs.lm_loss + alpha * outputs.indexer_kl_loss
    ```
 
 4. **Dual LoRA with separate backward passes**:
@@ -409,7 +455,7 @@ The implementation provides **two independent gradient paths** for flexible trai
 | `indexer_kl_loss` | `indexer_scores` → `LightningIndexer` | **Only** indexer parameters (`indexer.wq_b`, `indexer.wk`, `indexer.weights_proj`) |
 
 **Why are they independent?**
-- The KL target (`indexer_kl_target`) is **detached** (line 724 in modular_deepseek_v32.py) - it receives no gradients
+- The KL target (`indexer_kl_target`) is **detached** - it receives no gradients
 - `indexer_kl_loss = KL(softmax(indexer_scores) || detached_attention_target)`
 - Gradients from `indexer_kl_loss` only flow through `indexer_scores` → indexer parameters
 
@@ -652,6 +698,10 @@ args = TrainingArguments(
 **Implementation details:**
 - Expert routing decisions are computed under `torch.no_grad()` ensuring determinism during recomputation
 - Works correctly with both FSDP and ZeRO-3
+
+**FSDP/Gradient Checkpointing Note for Indexer Training:**
+
+Indexer outputs (`_indexer_scores`, `_indexer_kl_targets`) are stored as instance attributes during forward() and consumed by `ForCausalLM` for KL loss computation. This is safe for FSDP since outputs are used within the same forward pass. With gradient checkpointing, these tensors are recomputed during backward - ensure `output_indexer_scores` and `output_indexer_kl_target` flags remain consistent between forward and recomputation to avoid shape mismatches.
 
 ### Multi-GPU Deployment Modes
 
