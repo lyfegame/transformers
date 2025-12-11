@@ -107,6 +107,10 @@ class DeepseekV3NaiveMoe(MixtralExperts):
     def __init__(self, config):
         super().__init__(config)
         self.num_experts = config.num_local_experts
+        # Override intermediate_dim to use moe_intermediate_size (MixtralExperts uses intermediate_size)
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
 
 
 class DeepseekV3MoE(nn.Module):
