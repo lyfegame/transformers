@@ -30,54 +30,41 @@ Key architectural differences from V3:
 Training API
 ------------
 
-The model supports two-stage training following the DeepSeek V3.2 technical report:
+The model supports the two-stage training protocol from the DeepSeek V3.2 technical report:
 
-**Stage 1 (SFT - Supervised Fine-Tuning):**
-    Train the main model with frozen indexer. Use standard `outputs.loss`.
+**Stage 1: Dense Warm-up (Indexer Training with Dense Attention)**
+    Train the indexer to match dense attention distribution. The main model is frozen,
+    only indexer parameters are updated. Uses dense attention for both forward pass
+    and KL target computation.
 
     ```python
-    model.config.indexer_kl_coef = 0.0  # Disable KL loss
+    # Freeze main model, train only indexer
+    for name, param in model.named_parameters():
+        param.requires_grad = "indexer" in name
+
+    model.config.use_sparse_attention = False  # Use dense attention
+    model.config.indexer_kl_coef = 1.0  # Train indexer with KL loss only
+
     outputs = model(input_ids, labels=labels)
-    loss = outputs.loss  # Pure LM loss
+    loss = outputs.indexer_kl_loss  # Only optimize indexer
     loss.backward()
     ```
 
-**Stage 2 (Indexer Training):**
-    Train the indexer to match the attention distribution using KL divergence loss.
-    Two approaches are supported:
+**Stage 2: Sparse Training (Joint Model + Indexer Training)**
+    Train both model and indexer with sparse attention. The KL target comes from
+    the sparse attention distribution (restricted to selected tokens).
 
-    *Option A: Joint training with combined loss*
     ```python
-    model.config.indexer_kl_coef = 0.1  # Enable KL loss
+    # Unfreeze all parameters
+    for param in model.parameters():
+        param.requires_grad = True
+
+    model.config.use_sparse_attention = True  # Use sparse attention
+    model.config.indexer_kl_coef = 0.1  # Small KL coefficient
+
     outputs = model(input_ids, labels=labels)
     loss = outputs.loss  # lm_loss + 0.1 * indexer_kl_loss
     loss.backward()
-    ```
-
-    *Option B: Dual LoRA with separate backward passes (for PEFT/verl)*
-    ```python
-    # Create separate optimizers for LLM and indexer parameters
-    llm_optimizer = AdamW([p for n, p in model.named_parameters() if "indexer" not in n])
-    indexer_optimizer = AdamW([p for n, p in model.named_parameters() if "indexer" in n])
-
-    # Forward pass with explicit indexer output request
-    model.config.indexer_kl_coef = 1.0  # Or set output_indexer_* explicitly
-    outputs = model(
-        input_ids,
-        labels=labels,
-        output_indexer_scores=True,
-        output_indexer_kl_target=True,
-    )
-
-    # Backward pass 1: LM loss -> LLM parameters
-    llm_optimizer.zero_grad()
-    outputs.lm_loss.backward(retain_graph=True)
-    llm_optimizer.step()
-
-    # Backward pass 2: KL loss -> Indexer parameters
-    indexer_optimizer.zero_grad()
-    outputs.indexer_kl_loss.backward()
-    indexer_optimizer.step()
     ```
 
 Output Fields
@@ -96,16 +83,15 @@ The model returns `CausalLMOutputWithIndexer` with the following fields:
 Config Options
 --------------
 
-- `indexer_kl_coef` (float, default=0.0): Coefficient for KL loss in combined loss.
-  Set to 0 for Stage 1 (SFT), > 0 for Stage 2 (indexer training).
-- `detach_indexer_input` (bool, default=False): Whether to detach indexer input
-  from the computational graph. Used in Stage 2 for separate optimization.
 - `use_sparse_attention` (bool, default=True): Whether to use sparse attention.
-  Set to False for dense warm-up training.
+  Set to False for Stage 1 (dense warm-up), True for Stage 2 (sparse training).
+- `indexer_kl_coef` (float, default=0.0): Coefficient for KL loss in combined loss.
+  Set > 0 to enable indexer training.
+- `detach_indexer_input` (bool, default=False): Whether to detach indexer input
+  from the computational graph. Useful for separate optimization.
 """
-import math
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -113,83 +99,41 @@ from torch import nn
 
 from ...cache_utils import Cache
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
+from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...processing_utils import Unpack
-from ...utils import auto_docstring, logging
+from ...utils import logging
 from ...utils.import_utils import is_hadamard_available
 
 
-# Custom argument documentation for the indexer-specific parameters
-DEEPSEEK_V32_INDEXER_ARGS = r"""
-        output_indexer_scores (`bool`, *optional*):
-            Whether to return raw indexer scores I_{t,s} from each layer. These are used
-            for computing the KL divergence loss during indexer training. Auto-enabled
-            when `config.indexer_kl_coef > 0`.
-        output_indexer_kl_target (`bool`, *optional*):
-            Whether to return KL target distributions p_{t,:} from each layer. These are
-            the L1-normalized attention distributions used as targets for KL loss.
-            Auto-enabled when `config.indexer_kl_coef > 0`.
-"""
-
-
 @dataclass
-class CausalLMOutputWithIndexer(ModelOutput):
+class CausalLMOutputWithIndexer(CausalLMOutputWithPast):
     """
-    Causal language model outputs with indexer KL loss for DeepSeek V3.2.
+    Causal language model outputs with indexer KL loss for DeepSeek V3.2 training.
+
+    Extends standard CausalLMOutputWithPast with additional fields for the two-stage
+    training protocol described in the V3.2 tech report.
 
     Args:
         loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
-            Combined loss (lm_loss + indexer_kl_coef * indexer_kl_loss when indexer_kl_coef > 0).
-        lm_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
-            Pure language modeling loss (for next-token prediction).
-        indexer_kl_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
-            KL divergence loss between indexer predictions and attention distribution.
-            Used for training the Lightning Indexer in Stage 2.
+            Combined loss = lm_loss + indexer_kl_coef * indexer_kl_loss. Returned when `labels` is provided.
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head.
-        past_key_values (`Cache`, *optional*):
-            Pre-computed key/value states for fast decoding.
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*):
+            Pre-computed hidden-states (key and value tensors) for fast auto-regressive decoding.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*):
-            Hidden states at each layer output.
+            Tuple of hidden-states at the output of each layer plus the initial embedding outputs.
         attentions (`tuple(torch.FloatTensor)`, *optional*):
-            Attention weights after softmax.
+            Tuple of attention weights after the attention softmax.
+        lm_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            Pure language modeling loss. Useful for dual-LoRA training where LLM and
+            indexer parameters are optimized separately.
+        indexer_kl_loss (`torch.FloatTensor` of shape `(1,)`, *optional*):
+            KL divergence loss for training the Lightning Indexer (Stage 2).
+            Computed as D_KL(attention_dist || indexer_dist).
     """
 
-    loss: Optional[torch.FloatTensor] = None
     lm_loss: Optional[torch.FloatTensor] = None
     indexer_kl_loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-
-
-@dataclass
-class BaseModelOutputWithIndexer(ModelOutput):
-    """
-    Base model outputs with indexer scores for DeepSeek V3.2.
-
-    Args:
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Hidden states at the output of the last layer.
-        past_key_values (`Cache`, *optional*):
-            Pre-computed key/value states for fast decoding.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*):
-            Hidden states at each layer output.
-        attentions (`tuple(torch.FloatTensor)`, *optional*):
-            Attention weights after softmax.
-        indexer_scores (`tuple(torch.FloatTensor)`, *optional*):
-            Raw indexer scores I_{t,s} from each layer.
-        indexer_kl_targets (`tuple(torch.FloatTensor)`, *optional*):
-            KL target distributions p_{t,:} from each layer.
-    """
-
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    indexer_scores: Optional[Tuple[torch.FloatTensor, ...]] = None
-    indexer_kl_targets: Optional[Tuple[torch.FloatTensor, ...]] = None
 
 
 from ..deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -197,18 +141,11 @@ from ..deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Attention,
     DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
-    DeepseekV3ForSequenceClassification,
-    DeepseekV3ForTokenClassification,
     DeepseekV3Model,
-    DeepseekV3MLP,
-    DeepseekV3MoE,
-    DeepseekV3NaiveMoe,
     DeepseekV3PreTrainedModel,
     DeepseekV3RMSNorm,
     DeepseekV3RotaryEmbedding,
-    DeepseekV3TopkRouter,
     apply_rotary_pos_emb_interleave,
-    yarn_get_mscale,
 )
 from ..llama.modeling_llama import apply_rotary_pos_emb
 
@@ -261,24 +198,12 @@ def hadamard_transform_fallback(x: torch.Tensor, scale: float = 1.0) -> torch.Te
     return (x * scale).to(orig_dtype)
 
 
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """
-    Apply Hadamard transform for activation rotation in the indexer.
-
-    This is used in the Lightning Indexer to rotate Q and K activations
-    before computing index scores.
-
-    Args:
-        x: Input tensor with shape (..., hidden_size)
-
-    Returns:
-        Rotated tensor with same shape
-    """
+def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Apply scaled Hadamard transform for the Lightning Indexer."""
     hidden_size = x.size(-1)
     scale = hidden_size**-0.5
 
     if is_hadamard_available():
-        # fast-hadamard-transform requires contiguous bfloat16 input
         return hadamard_transform(x.contiguous(), scale=scale)
     else:
         return hadamard_transform_fallback(x, scale=scale)
@@ -400,35 +325,6 @@ class DeepseekV32Config(DeepseekV3Config):
         self.scoring_func = scoring_func
 
 
-class DeepseekV32RMSNorm(DeepseekV3RMSNorm):
-    """RMSNorm for DeepSeek V3.2, inherited from V3.
-
-    Per the V3.2 tech report, the only architectural difference from V3 is
-    DeepSeek Sparse Attention (DSA). All other components are identical.
-    """
-
-    pass
-
-
-class DeepseekV32RotaryEmbedding(DeepseekV3RotaryEmbedding):
-    pass
-
-
-class DeepseekV32MLP(DeepseekV3MLP):
-    pass
-
-
-class DeepseekV32TopkRouter(DeepseekV3TopkRouter):
-    pass
-
-
-class DeepseekV32NaiveMoe(DeepseekV3NaiveMoe):
-    pass
-
-
-class DeepseekV32MoE(DeepseekV3MoE):
-    pass
-
 
 class DeepseekV32Indexer(nn.Module):
     """
@@ -533,8 +429,8 @@ class DeepseekV32Indexer(nn.Module):
         k = torch.cat([k_rope, k_nope], dim=-1)  # [B, S, D]
 
         # Apply Hadamard transform for activation rotation
-        q = rotate_activation(q)
-        k = rotate_activation(k)
+        q = _hadamard_transform(q)
+        k = _hadamard_transform(k)
 
         # Compute index scores: I_{t,s} = sum_j w_{t,j} * ReLU(q_{t,j} * k_s)
         # q: [B, S, H, D], k: [B, S, D]
@@ -549,6 +445,8 @@ class DeepseekV32Indexer(nn.Module):
         scores = F.relu(scores)
 
         # Get per-head weights
+        # Official scaling: weights * n_heads^{-0.5} * softmax_scale * q_scale
+        # q_scale is FP8-specific (quantization scaling), omitted for training
         weights = self.weights_proj(hidden_states)  # [B, S, H]
         weights = weights * (self.num_heads**-0.5) * self.softmax_scale
         weights = weights.transpose(1, 2).unsqueeze(-1)  # [B, H, S, 1]
@@ -696,10 +594,18 @@ class DeepseekV32Attention(DeepseekV3Attention):
             and seq_length > 1  # Only for prefill, not decode
         )
 
-        # If not using sparse attention, use dense attention (V3 path)
-        # This handles decode (seq_len=1) and when use_sparse_attention=False
-        if not use_sparse:
-            # Call parent's dense attention and add None for indexer outputs
+        # Check if we need indexer outputs for warm-up training
+        # During warm-up (use_sparse_attention=False), we still need to compute
+        # indexer scores and KL target from dense attention
+        need_warmup_kl = (
+            not self.config.use_sparse_attention
+            and self.q_lora_rank is not None
+            and seq_length > 1
+            and (output_indexer_scores or output_indexer_kl_target)
+        )
+
+        # If not using sparse attention and don't need warm-up KL, use V3 path
+        if not use_sparse and not need_warmup_kl:
             attn_output, attn_weights = DeepseekV3Attention.forward(
                 self,
                 hidden_states=hidden_states,
@@ -710,6 +616,20 @@ class DeepseekV32Attention(DeepseekV3Attention):
                 **kwargs,
             )
             return attn_output, attn_weights, None, None
+
+        # Dense warm-up path: compute dense attention but also indexer outputs
+        # This is used when use_sparse_attention=False but indexer_kl_coef > 0
+        if need_warmup_kl:
+            return self._forward_dense_warmup(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                output_indexer_scores=output_indexer_scores,
+                output_indexer_kl_target=output_indexer_kl_target,
+                **kwargs,
+            )
 
         # Sparse attention path (eager computation, matching official DeepSeek code)
         query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
@@ -819,26 +739,129 @@ class DeepseekV32Attention(DeepseekV3Attention):
 
         return attn_output, attn_weights, indexer_scores, indexer_kl_target
 
+    def _forward_dense_warmup(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        output_indexer_scores: bool = False,
+        output_indexer_kl_target: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Dense attention forward pass for warm-up training.
+
+        During warm-up (use_sparse_attention=False, indexer_kl_coef > 0), we compute:
+        1. Dense attention (no sparse mask) for the forward pass
+        2. Indexer scores for KL loss computation
+        3. KL target from dense attention distribution
+
+        This trains the indexer to predict which tokens dense attention focuses on.
+        """
+        batch_size, seq_length = hidden_states.shape[:-1]
+        query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
+        key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
+
+        # Query path with LoRA compression
+        q_compressed = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q_states = self.q_b_proj(q_compressed)
+
+        # Optionally detach for separate indexer optimization
+        if self.config.detach_indexer_input:
+            q_compressed_for_indexer = q_compressed.detach()
+        else:
+            q_compressed_for_indexer = q_compressed
+
+        q_states = q_states.view(query_shape).transpose(1, 2)
+        q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # KV path with compression
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
+        k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
+
+        # Apply RoPE (INTERLEAVED for MLA)
+        cos, sin = position_embeddings
+        if self.config.rope_interleave:
+            q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
+        else:
+            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+
+        k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+
+        query_states = torch.cat((q_pass, q_rot), dim=-1)
+        key_states = torch.cat((k_pass, k_rot), dim=-1)
+
+        # Update cache if provided (unlikely during training)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        # Compute indexer scores (needed for KL loss)
+        indexer_scores = None
+        if output_indexer_scores or output_indexer_kl_target:
+            _, indexer_scores = self.indexer(
+                hidden_states,
+                q_compressed_for_indexer,
+                position_embeddings,
+                attention_mask,
+                output_scores=True,
+            )
+
+        # Dense attention (no sparse mask) - this is the key difference from sparse path
+        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
+
+        # Apply causal mask only (no sparse mask)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # Compute KL target from DENSE attention (before dropout!)
+        # This is the target the indexer learns to predict during warm-up
+        indexer_kl_target = None
+        if output_indexer_kl_target:
+            # attn_weights: [B, H, S_q, S_k] - post-softmax DENSE attention
+            # Sum across heads: [B, S_q, S_k]
+            attn_sum = attn_weights.sum(dim=1)
+            # L1 normalize along key dimension to get target distribution p_{t,:}
+            indexer_kl_target = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + 1e-10)
+            # Detach - target should not receive gradients
+            indexer_kl_target = indexer_kl_target.detach()
+
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights, indexer_scores, indexer_kl_target
+
 
 class DeepseekV32DecoderLayer(DeepseekV3DecoderLayer):
-    """DeepSeek V3.2 decoder layer with sparse attention."""
+    """
+    DeepSeek V3.2 decoder layer.
+
+    Only difference from V3: uses DeepseekV32Attention with Lightning Indexer.
+
+    Note: forward() must be overridden because V3.2 attention returns 4 values
+    (hidden_states, attn_weights, indexer_scores, indexer_kl_target) vs V3's 2 values.
+    This signature change propagates up, requiring a full forward override.
+    The MLP logic (4 lines) is duplicated but factoring it out would add complexity.
+    """
 
     def __init__(self, config: DeepseekV32Config, layer_idx: int):
-        # Call grandparent init to avoid V3 attention
-        nn.Module.__init__(self)
-        self.hidden_size = config.hidden_size
-
-        # Use V3.2 attention with indexer
+        super().__init__(config, layer_idx)
         self.self_attn = DeepseekV32Attention(config=config, layer_idx=layer_idx)
-
-        # MLP: dense for first k layers, MoE for rest
-        if layer_idx >= config.first_k_dense_replace:
-            self.mlp = DeepseekV32MoE(config)
-        else:
-            self.mlp = DeepseekV32MLP(config)
-
-        self.input_layernorm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -853,20 +876,11 @@ class DeepseekV32DecoderLayer(DeepseekV3DecoderLayer):
         output_indexer_kl_target: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Forward pass for the decoder layer.
-
-        Returns:
-            Tuple of (hidden_states, attn_weights, indexer_scores, indexer_kl_target)
-            - hidden_states: Output hidden states
-            - attn_weights: Attention weights (optional, for output_attentions)
-            - indexer_scores: Raw indexer scores I_{t,s} (optional, for KL loss)
-            - indexer_kl_target: KL target distribution p_{t,:} (optional, for KL loss)
-        """
+        """Forward pass. Returns (hidden_states, attn_weights, indexer_scores, indexer_kl_target)."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention - V3.2 attention returns 4 values
+        # V3.2 attention returns 4 values (vs 2 for V3)
         hidden_states, attn_weights, indexer_scores, indexer_kl_target = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -879,14 +893,12 @@ class DeepseekV32DecoderLayer(DeepseekV3DecoderLayer):
             output_indexer_kl_target=output_indexer_kl_target,
             **kwargs,
         )
-        # Let FSDP/ZeRO-3 manage device placement - no explicit .to() calls
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # MLP (identical to V3)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        # Let FSDP/ZeRO-3 manage device placement - no explicit .to() calls
         hidden_states = residual + hidden_states
 
         return hidden_states, attn_weights, indexer_scores, indexer_kl_target
@@ -903,7 +915,17 @@ class DeepseekV32PreTrainedModel(DeepseekV3PreTrainedModel):
 
 
 class DeepseekV32Model(DeepseekV3Model):
-    """DeepSeek V3.2 Model with sparse attention."""
+    """
+    DeepSeek V3.2 Model with sparse attention.
+
+    FSDP/Gradient Checkpointing Note:
+        Indexer outputs (`_indexer_scores`, `_indexer_kl_targets`) are stored as instance
+        attributes during forward() and consumed by ForCausalLM for KL loss computation.
+        This is safe for FSDP since outputs are used within the same forward pass.
+        With gradient checkpointing, these tensors are recomputed during backward - ensure
+        `output_indexer_scores` and `output_indexer_kl_target` flags remain consistent
+        between forward and recomputation to avoid shape mismatches.
+    """
 
     config_class = DeepseekV32Config
 
@@ -916,15 +938,12 @@ class DeepseekV32Model(DeepseekV3Model):
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
+        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
-
-        # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring(custom_args=DEEPSEEK_V32_INDEXER_ARGS)
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -939,7 +958,21 @@ class DeepseekV32Model(DeepseekV3Model):
         output_indexer_scores: Optional[bool] = None,
         output_indexer_kl_target: Optional[bool] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> BaseModelOutputWithIndexer:
+    ) -> BaseModelOutputWithPast:
+        """
+        Forward pass returning standard BaseModelOutputWithPast.
+
+        For training with indexer KL loss, use DeepseekV32ForCausalLM which
+        handles indexer score collection and KL loss computation internally.
+
+        Args:
+            output_indexer_scores (`bool`, *optional*):
+                Whether to return the indexer scores. If None, defaults to True when
+                `config.indexer_kl_coef > 0`.
+            output_indexer_kl_target (`bool`, *optional*):
+                Whether to return the KL target (attention distributions) for indexer training.
+                If None, defaults to True when `config.indexer_kl_coef > 0`.
+        """
         from ...cache_utils import DynamicCache
         from ...masking_utils import create_causal_mask
 
@@ -985,8 +1018,9 @@ class DeepseekV32Model(DeepseekV3Model):
         # Accumulate outputs
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
-        all_indexer_scores = () if output_indexer_scores else None
-        all_indexer_kl_targets = () if output_indexer_kl_target else None
+        # Store indexer outputs for KL loss computation (used by ForCausalLM)
+        self._indexer_scores = () if output_indexer_scores else None
+        self._indexer_kl_targets = () if output_indexer_kl_target else None
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
@@ -1010,29 +1044,53 @@ class DeepseekV32Model(DeepseekV3Model):
                 all_attentions = all_attentions + (attn_weights,)
 
             if output_indexer_scores and indexer_scores is not None:
-                all_indexer_scores = all_indexer_scores + (indexer_scores,)
+                self._indexer_scores = self._indexer_scores + (indexer_scores,)
 
             if output_indexer_kl_target and indexer_kl_target is not None:
-                all_indexer_kl_targets = all_indexer_kl_targets + (indexer_kl_target,)
+                self._indexer_kl_targets = self._indexer_kl_targets + (indexer_kl_target,)
 
         hidden_states = self.norm(hidden_states)
 
-        # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        return BaseModelOutputWithIndexer(
+        return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
-            indexer_scores=all_indexer_scores,
-            indexer_kl_targets=all_indexer_kl_targets,
         )
 
 
 class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
-    """DeepSeek V3.2 for causal language modeling with indexer KL loss support."""
+    """
+    DeepSeek V3.2 for causal language modeling with indexer KL loss support.
+
+    Training API for the Lightning Indexer (two-stage training per tech report):
+
+    **Stage 1 (SFT):** Train main model with frozen indexer.
+        ```python
+        model.config.indexer_kl_coef = 0.0  # Disable KL loss
+        outputs = model(input_ids, labels=labels)
+        loss = outputs.loss  # Pure LM loss
+        ```
+
+    **Stage 2 (Indexer Training):** Train indexer to match attention distribution.
+        ```python
+        model.config.indexer_kl_coef = 0.1  # Enable KL loss
+        outputs = model(input_ids, labels=labels)
+        loss = outputs.loss  # lm_loss + 0.1 * indexer_kl_loss
+        ```
+
+    For dual-LoRA training (separate optimizers for LLM and indexer):
+        ```python
+        outputs = model(input_ids, labels=labels)
+        # Backward pass 1: LM loss -> LLM parameters
+        outputs.lm_loss.backward(retain_graph=True)
+        # Backward pass 2: KL loss -> Indexer parameters (weights contain "indexer")
+        outputs.indexer_kl_loss.backward()
+        ```
+    """
 
     config_class = DeepseekV32Config
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -1042,11 +1100,8 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         self.model = DeepseekV32Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring(custom_args=DEEPSEEK_V32_INDEXER_ARGS)
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1060,18 +1115,12 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        output_indexer_scores: Optional[bool] = None,
-        output_indexer_kl_target: Optional[bool] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> CausalLMOutputWithIndexer:
         # Auto-enable indexer outputs if KL loss is configured
         compute_kl_loss = self.config.indexer_kl_coef > 0
-        if output_indexer_scores is None:
-            output_indexer_scores = compute_kl_loss
-        if output_indexer_kl_target is None:
-            output_indexer_kl_target = compute_kl_loss
 
-        outputs: BaseModelOutputWithIndexer = self.model(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1081,13 +1130,12 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
             cache_position=cache_position,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            output_indexer_scores=output_indexer_scores,
-            output_indexer_kl_target=output_indexer_kl_target,
+            output_indexer_scores=compute_kl_loss,
+            output_indexer_kl_target=compute_kl_loss,
             **kwargs,
         )
 
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
@@ -1096,25 +1144,24 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         if labels is not None:
             lm_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        # Compute indexer KL loss if we have the required outputs
+        # Compute indexer KL loss from model's internal state
         indexer_kl_loss = None
         if (
-            outputs.indexer_scores is not None
-            and outputs.indexer_kl_targets is not None
-            and len(outputs.indexer_scores) > 0
-            and len(outputs.indexer_kl_targets) > 0
+            compute_kl_loss
+            and self.model._indexer_scores is not None
+            and self.model._indexer_kl_targets is not None
+            and len(self.model._indexer_scores) > 0
         ):
             indexer_kl_loss = compute_indexer_kl_loss(
-                outputs.indexer_scores,
-                outputs.indexer_kl_targets,
+                self.model._indexer_scores,
+                self.model._indexer_kl_targets,
             )
 
         # Compute combined loss
         loss = None
         if lm_loss is not None:
             loss = lm_loss
-            if indexer_kl_loss is not None and self.config.indexer_kl_coef > 0:
-                # Move indexer_kl_loss to same device as loss for multi-GPU compatibility
+            if indexer_kl_loss is not None:
                 loss = loss + self.config.indexer_kl_coef * indexer_kl_loss.to(loss.device)
 
         return CausalLMOutputWithIndexer(
@@ -1128,23 +1175,9 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
         )
 
 
-class DeepseekV32ForSequenceClassification(DeepseekV3ForSequenceClassification):
-    """DeepSeek V3.2 for sequence classification."""
-
-    config_class = DeepseekV32Config
-
-
-class DeepseekV32ForTokenClassification(DeepseekV3ForTokenClassification):
-    """DeepSeek V3.2 for token classification."""
-
-    config_class = DeepseekV32Config
-
-
 __all__ = [
     "DeepseekV32Config",
     "DeepseekV32PreTrainedModel",
     "DeepseekV32Model",
     "DeepseekV32ForCausalLM",
-    "DeepseekV32ForSequenceClassification",
-    "DeepseekV32ForTokenClassification",
 ]
