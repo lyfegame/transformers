@@ -152,6 +152,16 @@ from ..llama.modeling_llama import apply_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
 
+
+# Aliases for V3.2 naming (inherit from V3 with no changes)
+class DeepseekV32RMSNorm(DeepseekV3RMSNorm):
+    pass
+
+
+class DeepseekV32RotaryEmbedding(DeepseekV3RotaryEmbedding):
+    pass
+
+
 # Import fast_hadamard_transform if available, otherwise use fallback
 if is_hadamard_available():
     from fast_hadamard_transform import hadamard_transform
@@ -662,7 +672,6 @@ class DeepseekV32Attention(DeepseekV3Attention):
         if self.config.rope_interleave:
             q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
         else:
-            from ..llama.modeling_llama import apply_rotary_pos_emb
             q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
 
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
@@ -938,8 +947,8 @@ class DeepseekV32Model(DeepseekV3Model):
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
+        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
         self.post_init()
