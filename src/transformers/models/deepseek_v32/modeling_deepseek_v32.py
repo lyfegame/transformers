@@ -169,12 +169,6 @@ def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
         return hadamard_transform_fallback(x, scale=scale)
 
 
-# Note: DeepseekV32RMSNorm, DeepseekV32RotaryEmbedding, DeepseekV32MLP, DeepseekV32MoE, etc.
-# are NOT needed because DeepseekV32DecoderLayer uses super().__init__() which
-# creates the MLP/MoE from the V3 parent class. The only architectural difference
-# from V3 is the Lightning Indexer in attention.
-
-
 class DeepseekV32Indexer(nn.Module):
     """
     Lightning Indexer for DeepSeek Sparse Attention (DSA).

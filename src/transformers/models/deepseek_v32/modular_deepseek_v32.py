@@ -325,11 +325,6 @@ class DeepseekV32Config(DeepseekV3Config):
         self.scoring_func = scoring_func
 
 
-# Note: DeepseekV32RMSNorm, DeepseekV32RotaryEmbedding, DeepseekV32MLP, DeepseekV32MoE, etc.
-# are NOT needed because DeepseekV32DecoderLayer uses super().__init__() which
-# creates the MLP/MoE from the V3 parent class. The only architectural difference
-# from V3 is the Lightning Indexer in attention.
-
 
 class DeepseekV32Indexer(nn.Module):
     """
