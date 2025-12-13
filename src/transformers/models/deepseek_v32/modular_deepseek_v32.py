@@ -243,41 +243,6 @@ class DeepseekV32Config(DeepseekV3Config):
 
     def __init__(
         self,
-        # Inherited from DeepseekV3Config (required for modular converter)
-        vocab_size: int = 129280,
-        hidden_size: int = 7168,
-        intermediate_size: int = 18432,
-        moe_intermediate_size: int = 2048,
-        num_hidden_layers: int = 61,
-        num_attention_heads: int = 128,
-        num_key_value_heads: int = 128,
-        n_shared_experts: int = 1,
-        n_routed_experts: int = 256,
-        routed_scaling_factor: float = 2.5,
-        kv_lora_rank: int = 512,
-        q_lora_rank: int = 1536,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        qk_nope_head_dim: int = 128,
-        n_group: int = 8,
-        topk_group: int = 4,
-        num_experts_per_tok: int = 8,
-        first_k_dense_replace: int = 3,
-        norm_topk_prob: bool = True,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 4096,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-6,
-        use_cache: bool = True,
-        pad_token_id: int = None,
-        bos_token_id: int = 0,
-        eos_token_id: int = 1,
-        pretraining_tp: int = 1,
-        tie_word_embeddings: bool = False,
-        rope_parameters=None,
-        rope_interleave: bool = True,
-        attention_bias: bool = False,
-        attention_dropout: float = 0.0,
         # V3.2 specific: Lightning Indexer parameters
         index_n_heads: int = 64,
         index_head_dim: int = 128,
@@ -285,46 +250,10 @@ class DeepseekV32Config(DeepseekV3Config):
         use_sparse_attention: bool = True,
         detach_indexer_input: bool = False,
         indexer_kl_coef: float = 0.0,
-        scoring_func: str = "sigmoid",  # V3.2 uses sigmoid
+        scoring_func: str = "sigmoid",
         **kwargs,
     ):
-        super().__init__(
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            moe_intermediate_size=moe_intermediate_size,
-            num_hidden_layers=num_hidden_layers,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            n_shared_experts=n_shared_experts,
-            n_routed_experts=n_routed_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            kv_lora_rank=kv_lora_rank,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            qk_nope_head_dim=qk_nope_head_dim,
-            n_group=n_group,
-            topk_group=topk_group,
-            num_experts_per_tok=num_experts_per_tok,
-            first_k_dense_replace=first_k_dense_replace,
-            norm_topk_prob=norm_topk_prob,
-            hidden_act=hidden_act,
-            max_position_embeddings=max_position_embeddings,
-            initializer_range=initializer_range,
-            rms_norm_eps=rms_norm_eps,
-            use_cache=use_cache,
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pretraining_tp=pretraining_tp,
-            tie_word_embeddings=tie_word_embeddings,
-            rope_parameters=rope_parameters,
-            rope_interleave=rope_interleave,
-            attention_bias=attention_bias,
-            attention_dropout=attention_dropout,
-            **kwargs,
-        )
+        super().__init__(**kwargs)
         # V3.2 specific: Lightning Indexer
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
@@ -939,19 +868,11 @@ class DeepseekV32Model(DeepseekV3Model):
     config_class = DeepseekV32Config
 
     def __init__(self, config: DeepseekV32Config):
-        DeepseekV32PreTrainedModel.__init__(self, config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        super().__init__(config)
+        # Override layers with V3.2 decoder layers (only difference from V3)
         self.layers = nn.ModuleList(
             [DeepseekV32DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = DeepseekV32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
-
-        self.gradient_checkpointing = False
-        self.post_init()
 
     def forward(
         self,
@@ -1105,11 +1026,9 @@ class DeepseekV32ForCausalLM(DeepseekV3ForCausalLM):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: DeepseekV32Config):
-        DeepseekV32PreTrainedModel.__init__(self, config)
+        super().__init__(config)
+        # Override model with V3.2 model (only difference from V3)
         self.model = DeepseekV32Model(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.post_init()
 
     def forward(
         self,
