@@ -21,12 +21,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 
-from ...configuration_utils import PreTrainedConfig
+from ...configuration_utils import PretrainedConfig
+from ...modeling_rope_utils import rope_config_validation
 
 
-class DeepseekV32Config(PreTrainedConfig):
+class DeepseekV32Config(PretrainedConfig):
     r"""
     Configuration class for DeepSeek V3.2 model.
 
@@ -48,63 +48,28 @@ class DeepseekV32Config(PreTrainedConfig):
 
     model_type = "deepseek_v32"
     keys_to_ignore_at_inference = ["past_key_values"]
-    base_model_tp_plan = {
-        "layers.*.mlp.experts.gate_up_proj": "local_rowwise",
-        "layers.*.mlp.experts.down_proj": "local_rowwise",
-        "layers.*.mlp.experts": "gather",
-        "layers.*.mlp.shared_experts.gate_proj": "colwise",
-        "layers.*.mlp.shared_experts.up_proj": "colwise",
-        "layers.*.mlp.shared_experts.down_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
+    base_model_tp_plan = {  # TODO: only replicate attention layers when > first_k_dense_replace
+        "layers.*.mlp.experts.*.gate_proj": "local_colwise",
+        "layers.*.mlp.experts.*.up_proj": "local_colwise",
+        "layers.*.mlp.experts.*.down_proj": "local_rowwise",
+        "layers.*.mlp.experts.*": "local",  # each expert is wrapped in a module list
+        "layers.*.mlp.shared_experts.gate_proj": "local_colwise",
+        "layers.*.mlp.shared_experts.up_proj": "local_colwise",
+        "layers.*.mlp.shared_experts.down_proj": "local_rowwise",
+        "layers.*.mlp.shared_experts": "local",
+        "layers.*.mlp.gate_proj": "local_colwise",
+        "layers.*.mlp.up_proj": "local_colwise",
+        "layers.*.mlp.down_proj": "local_rowwise",
+        "layers.*.mlp": "gather",  # This is the only moment where results are gathered
     }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
         "norm": (["hidden_states"], ["hidden_states"]),
     }
-    attribute_map = {
-        "num_local_experts": "n_routed_experts",
-    }
 
     def __init__(
         self,
-        # Inherited from DeepseekV3Config (required for modular converter)
-        vocab_size: int = 129280,
-        hidden_size: int = 7168,
-        intermediate_size: int = 18432,
-        moe_intermediate_size: int = 2048,
-        num_hidden_layers: int = 61,
-        num_attention_heads: int = 128,
-        num_key_value_heads: int = 128,
-        n_shared_experts: int = 1,
-        n_routed_experts: int = 256,
-        routed_scaling_factor: float = 2.5,
-        kv_lora_rank: int = 512,
-        q_lora_rank: int = 1536,
-        qk_rope_head_dim: int = 64,
-        v_head_dim: int = 128,
-        qk_nope_head_dim: int = 128,
-        n_group: int = 8,
-        topk_group: int = 4,
-        num_experts_per_tok: int = 8,
-        first_k_dense_replace: int = 3,
-        norm_topk_prob: bool = True,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 4096,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-6,
-        use_cache: bool = True,
-        pad_token_id: int = None,
-        bos_token_id: int = 0,
-        eos_token_id: int = 1,
-        pretraining_tp: int = 1,
-        tie_word_embeddings: bool = False,
-        rope_parameters=None,
-        rope_interleave: bool = True,
-        attention_bias: bool = False,
-        attention_dropout: float = 0.0,
         # V3.2 specific: Lightning Indexer parameters
         index_n_heads: int = 64,
         index_head_dim: int = 128,
@@ -112,9 +77,16 @@ class DeepseekV32Config(PreTrainedConfig):
         use_sparse_attention: bool = True,
         detach_indexer_input: bool = False,
         indexer_kl_coef: float = 0.0,
-        scoring_func: str = "sigmoid",  # V3.2 uses sigmoid
+        scoring_func: str = "sigmoid",
         **kwargs,
     ):
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -149,17 +121,21 @@ class DeepseekV32Config(PreTrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.pretraining_tp = pretraining_tp
         self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.rope_parameters = rope_parameters
+        # Validate the correctness of rotary position embeddings parameters
+        # BC: if there is a 'type' field, copy it it to 'rope_type'.
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        if self.rope_scaling is not None:
+            for key in ["beta_fast", "beta_slow", "factor"]:
+                if key in self.rope_scaling:
+                    self.rope_scaling[key] = float(self.rope_scaling[key])
+
+        rope_config_validation(self)
         # V3.2 specific: Lightning Indexer
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
@@ -168,22 +144,6 @@ class DeepseekV32Config(PreTrainedConfig):
         self.detach_indexer_input = detach_indexer_input
         self.indexer_kl_coef = indexer_kl_coef
         self.scoring_func = scoring_func
-
-    def convert_rope_params_to_dict(self, ignore_keys_at_rope_validation: Optional[set] = None, **kwargs):
-        rope_scaling = kwargs.pop("rope_scaling", None)
-        self.rope_parameters = rope_scaling or self.rope_parameters
-        self.rope_parameters = self.rope_parameters if self.rope_parameters is not None else {}
-
-        # Standardize and validate the correctness of rotary position embeddings parameters
-        self.rope_parameters.setdefault("rope_theta", kwargs.pop("rope_theta", self.default_theta))
-        self.standardize_rope_params()
-        self.validate_rope(ignore_keys=ignore_keys_at_rope_validation)
-
-        # Convert to float because RoPE fn expect a float. Models on the hub were saved as int
-        for key in ["beta_fast", "beta_slow", "factor"]:
-            if key in self.rope_parameters:
-                self.rope_parameters[key] = float(self.rope_parameters[key])
-        return kwargs
 
 
 __all__ = ["DeepseekV32Config"]
