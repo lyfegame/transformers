@@ -410,8 +410,18 @@ class DeepseekV32Indexer(nn.Module):
             topk_indices: Indices of selected tokens [batch, seq_len, topk]
             index_scores: (optional) Raw index scores [batch, seq_len, seq_len] if output_scores=True
         """
+        import os
+        DEBUG_INDEXER = os.environ.get("DEBUG_DEEPSEEK_INDEXER", "0") == "1"
+
         batch_size, seq_len, _ = hidden_states.shape
         cos, sin = position_embeddings
+
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === SHAPES ===")
+            logger.warning(f"  hidden_states: {hidden_states.shape}")
+            logger.warning(f"  q_compressed: {q_compressed.shape}")
+            logger.warning(f"  cos: {cos.shape}, sin: {sin.shape}")
+            logger.warning(f"  attention_mask: {attention_mask.shape if attention_mask is not None else None}")
 
         # Query path
         q = self.wq_b(q_compressed)  # [B, S, num_heads * head_dim]
@@ -430,10 +440,25 @@ class DeepseekV32Indexer(nn.Module):
             k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
         )
 
-        # Apply RoPE (Llama's apply_rotary_pos_emb is non-interleaved by default)
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === Q/K SHAPES ===")
+            logger.warning(f"  q: {q.shape}, q_rope: {q_rope.shape}, q_nope: {q_nope.shape}")
+            logger.warning(f"  k: {k.shape}, k_rope: {k_rope.shape}, k_nope: {k_nope.shape}")
+            logger.warning(f"  qk_rope_head_dim: {self.qk_rope_head_dim}, head_dim: {self.head_dim}")
+
+        # Apply RoPE - the indexer uses NON-INTERLEAVED RoPE (same as llama)
+        # But the cos/sin from rotary_emb might be sized for qk_rope_head_dim (64)
+        # We need to slice cos/sin to match the rope dimension
+        cos_rope = cos[..., :self.qk_rope_head_dim]  # [B, S, rope_dim]
+        sin_rope = sin[..., :self.qk_rope_head_dim]  # [B, S, rope_dim]
+
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === ROPE SLICED ===")
+            logger.warning(f"  cos_rope: {cos_rope.shape}, sin_rope: {sin_rope.shape}")
+
         # unsqueeze_dim=2 for shape [B, S, heads, dim]
         k_rope = k_rope.unsqueeze(2)  # [B, S, 1, rope_dim]
-        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos, sin, unsqueeze_dim=2)
+        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope, cos_rope, sin_rope, unsqueeze_dim=2)
         k_rope = k_rope.squeeze(2)  # [B, S, rope_dim]
 
         # Concatenate back
@@ -443,6 +468,11 @@ class DeepseekV32Indexer(nn.Module):
         # Apply Hadamard transform for activation rotation
         q = _hadamard_transform(q)
         k = _hadamard_transform(k)
+
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === AFTER HADAMARD ===")
+            logger.warning(f"  q: {q.shape}, mean={q.mean().item():.4f}, std={q.std().item():.4f}")
+            logger.warning(f"  k: {k.shape}, mean={k.mean().item():.4f}, std={k.std().item():.4f}")
 
         # Compute index scores: I_{t,s} = sum_j w_{t,j} * ReLU(q_{t,j} * k_s)
         # q: [B, S, H, D], k: [B, S, D]
@@ -456,6 +486,12 @@ class DeepseekV32Indexer(nn.Module):
         # Apply ReLU
         scores = F.relu(scores)
 
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === SCORES ===")
+            logger.warning(f"  scores (after ReLU): {scores.shape}")
+            logger.warning(f"  scores stats: min={scores.min().item():.4f}, max={scores.max().item():.4f}, "
+                          f"mean={scores.mean().item():.4f}, nonzero_frac={(scores > 0).float().mean().item():.4f}")
+
         # Get per-head weights
         # Official scaling: weights * n_heads^{-0.5} * softmax_scale * q_scale
         # q_scale is FP8-specific (quantization scaling), omitted for training
@@ -463,19 +499,48 @@ class DeepseekV32Indexer(nn.Module):
         weights = weights * (self.num_heads**-0.5) * self.softmax_scale
         weights = weights.transpose(1, 2).unsqueeze(-1)  # [B, H, S, 1]
 
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === WEIGHTS ===")
+            logger.warning(f"  weights: {weights.shape}")
+            logger.warning(f"  weights stats: min={weights.min().item():.4f}, max={weights.max().item():.4f}, "
+                          f"mean={weights.mean().item():.4f}")
+
         # Weighted sum over heads: [B, S_q, S_k]
         index_scores = (scores * weights).sum(dim=1)  # [B, S_q, S_k]
+
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === INDEX SCORES (before mask) ===")
+            logger.warning(f"  index_scores: {index_scores.shape}")
+            logger.warning(f"  stats: min={index_scores.min().item():.4f}, max={index_scores.max().item():.4f}, "
+                          f"mean={index_scores.mean().item():.4f}")
 
         # Apply attention mask if provided
         if attention_mask is not None:
             # attention_mask is typically [B, 1, S_q, S_k] or [B, S_q, S_k]
             if attention_mask.dim() == 4:
                 attention_mask = attention_mask.squeeze(1)
+            if DEBUG_INDEXER and self.layer_idx == 0:
+                logger.warning(f"[Indexer L{self.layer_idx}] === ATTENTION MASK ===")
+                logger.warning(f"  mask shape: {attention_mask.shape}")
+                logger.warning(f"  mask stats: min={attention_mask.min().item():.4f}, max={attention_mask.max().item():.4f}")
+                # Check causal structure
+                if seq_len > 1:
+                    logger.warning(f"  mask[0,0,:]: {attention_mask[0, 0, :5].tolist()}... (first query, first 5 keys)")
+                    logger.warning(f"  mask[0,-1,:]: {attention_mask[0, -1, -5:].tolist()}... (last query, last 5 keys)")
             index_scores = index_scores + attention_mask
 
         # Select top-k tokens
         k_select = min(self.index_topk, seq_len)
         topk_indices = index_scores.topk(k_select, dim=-1).indices  # [B, S, topk]
+
+        if DEBUG_INDEXER and self.layer_idx == 0:
+            logger.warning(f"[Indexer L{self.layer_idx}] === TOP-K SELECTION ===")
+            logger.warning(f"  k_select: {k_select}, index_topk: {self.index_topk}, seq_len: {seq_len}")
+            logger.warning(f"  topk_indices: {topk_indices.shape}")
+            # Show which tokens are selected for first and last query position
+            logger.warning(f"  topk for query[0] (first token): {topk_indices[0, 0, :10].tolist()}...")
+            if seq_len > 1:
+                logger.warning(f"  topk for query[-1] (last token): {topk_indices[0, -1, :10].tolist()}...")
 
         if output_scores:
             return topk_indices, index_scores
