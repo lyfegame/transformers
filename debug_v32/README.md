@@ -145,27 +145,60 @@ NameError: name 'DeepseekV3Attention' is not defined. Did you mean: 'DeepseekV32
 
 **Date:** 2024-12-14
 **Commit:** `2832e50657` - "Fix 1: Replace DeepseekV3Attention.forward with super().forward"
-**Status:** 🔄 TESTING IN PROGRESS
+**Status:** ❌ FAILED - TypeError
 
 **Change Made (modular_deepseek_v32.py line 686):**
 ```python
-# BEFORE (broken in standalone):
-attn_output, attn_weights = DeepseekV3Attention.forward(
-    self,
-    hidden_states=hidden_states,
-    ...
-)
-
-# AFTER (works in both modular and standalone):
-attn_output, attn_weights = super().forward(
-    hidden_states=hidden_states,
-    ...
-)
+# BEFORE:
+DeepseekV3Attention.forward(self, ...)
+# AFTER:
+super().forward(...)
 ```
 
-**Test:** Running on cluster, check `/tmp/fix1_test.log`
+**Results:**
+- First forward pass succeeded but logits diverged (cosine 0.931)
+- Generation crashed:
+```
+TypeError: _forward_unimplemented() got an unexpected keyword argument 'hidden_states'
+```
 
-**Results:** _(pending)_
+**Root Cause:** Generated standalone has `class DeepseekV32Attention(nn.Module)`, not from `DeepseekV3Attention`. So `super().forward()` → `nn.Module.forward()` which is unimplemented.
+
+---
+
+#### Fix 2: Use _forward_dense_warmup instead of super().forward
+
+**Date:** 2024-12-14
+**Commit:** `c90e8d9a10` - "Fix 2: Use _forward_dense_warmup instead of super().forward"
+**Status:** ⚠️ PARTIAL SUCCESS - No crash but logits diverge
+
+**Change Made:** Replace `super().forward(...)` with `self._forward_dense_warmup(..., output_indexer_scores=False, output_indexer_kl_target=False, ...)`
+
+**Results:**
+| Prompt | Token Match | Logits Cosine | Indexer |
+|--------|-------------|---------------|---------|
+| 0 (simple_math) | ❌ | 0.931 | ✅ set_match |
+| 1 (greeting) | ✅ | 0.929 | ✅ set_match |
+| 2 (code_generation) | ❌ | 0.884 | ✅ set_match |
+| 3 (explanation) | ✅ | 0.919 | ✅ set_match |
+| 4 (long_context) | ❌ | 0.967 | ✅ set_match |
+
+**Layer-by-Layer Divergence (Prompt 4):**
+```
+layer_0: cos=0.997 (close)
+layer_1: cos=0.912 (diverging)
+layer_2: cos=0.766 (diverged)
+layer_3: cos=0.879 (diverged)
+layer_4: cos=0.734 (diverged)
+```
+
+**Analysis:**
+1. ✅ NO CRASH - `_forward_dense_warmup` works as fallback
+2. ✅ INDEXER WORKS - All "set_match" on all prompts
+3. ❌ LOGITS DIVERGE - All below 0.93, not meeting 0.99 threshold
+4. Divergence starts at layer 1, suggesting core attention issue
+
+**Root Cause:** The RoPE implementation or MLA computation differs from reference. The modular uses HF's `apply_rotary_pos_emb`/`apply_rotary_pos_emb_interleave` while the working cluster version used custom `apply_rotary_emb(x, freqs_cis, interleaved=True)` with complex numbers.
 
 ---
 
