@@ -830,6 +830,8 @@ class DeepseekV32Attention(DeepseekV3Attention):
                 attn_sum = attn_weights.sum(dim=1)
                 indexer_kl_target = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + 1e-10)
                 indexer_kl_target = indexer_kl_target.detach()
+            else:
+                attn_weights = None
         else:
             # Standard attention for short sequences (no chunking needed)
             attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
