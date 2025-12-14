@@ -1,6 +1,133 @@
 # DeepSeek V3.2 HuggingFace Fork - Debug Strategy
 
-## Latest Status (2024-12-13)
+## Testing Methodology
+
+### Design Principles
+
+1. **Occam's Razor**: Only modify V3.2 files, never touch V3 or other model code
+2. **HF Convention**: Edit `modular_deepseek_v32.py` → regenerate `modeling_deepseek_v32.py`
+3. **Facts over opinions**: Document actual test results, not assumptions
+
+### Success Criteria (Priority Order)
+
+1. **Semantic equivalence**: Generated text has the same meaning as reference output
+2. **No crashes**: All 6 prompts complete without error
+3. **Correct sparse behavior**: Prompt 5 (2250 tokens) triggers sparse attention with shape `[1, 2250, 2048]`
+
+Note: Logits cosine similarity is for **debugging**, not the success metric.
+
+### Test Procedure (MUST follow after ANY code change)
+
+```bash
+# 1. Commit and push changes
+git add src/transformers/models/deepseek_v32/
+git commit -m "Description of change"
+git push origin shuyingl/deepseek-v32-minimal-on-v4.57.3
+
+# 2. Reinstall on cluster
+gcloud compute ssh h200-mig-cluster-rn1h --zone=europe-west1-b --tunnel-through-iap --command='
+pip install --force-reinstall git+https://github.com/lyfegame/transformers@shuyingl/deepseek-v32-minimal-on-v4.57.3
+'
+
+# 3. Test ALL 6 prompts with max_new_tokens=200 for semantic comparison
+gcloud compute ssh h200-mig-cluster-rn1h --zone=europe-west1-b --tunnel-through-iap --command='
+cd ~/debug_v32 && nohup python profile_inference.py \
+    --checkpoint /models-local/DeepSeek-V3.2-bf16 \
+    --prompts-json reference_prompts.json \
+    --prompt-ids 0,1,2,3,4,5 \
+    --use-sparse \
+    --max-new-tokens 200 \
+    > /tmp/test_all_prompts.log 2>&1 &
+'
+
+# 4. Check results (after ~5-10 min)
+gcloud compute ssh h200-mig-cluster-rn1h --zone=europe-west1-b --tunnel-through-iap --command='
+tail -200 /tmp/test_all_prompts.log
+'
+```
+
+### Reference Outputs (Official Inference)
+
+| Prompt | Name | Input Tokens | Expected Output (first 100 chars) |
+|--------|------|--------------|-----------------------------------|
+| 0 | simple_math | 10 | "2 + 2 = 4" |
+| 1 | greeting | 11 | "Hello! I'm doing well, thank you for asking!..." |
+| 2 | code_generation | 15 | "Here's a Python function... def is_prime(n):..." |
+| 3 | explanation | 13 | "Of course! Here is the theory of relativity..." |
+| 4 | long_context | 188 | "Based on the document... 1. Supervised 2. Unsupervised 3. Reinforcement" |
+| 5 | sparse_trigger | 2250 | "Based on the document... MLA, Lightning Indexer, RoPE..." |
+
+### Reference Data Locations
+
+| Resource | Location |
+|----------|----------|
+| Official tensors | `/mnt/models-disk/official_tensors/prompt_N_*/` (cluster) |
+| BF16 checkpoint | `/models-local/DeepSeek-V3.2-bf16` (cluster) |
+| Reference prompts | `debug_v32/reference_prompts.json` (local) |
+| Long prompt file | `debug_v32/long_prompt_sparse.txt` (local + cluster) |
+
+### Official Code Analysis (Reference)
+
+**Source**: `/deepseek-v3.2-inference/model.py` on cluster (or HuggingFace repo)
+
+**Key Finding**: The official code **always runs the Indexer** - there is no `use_sparse_attention` toggle.
+
+```python
+# In MLA.forward() - Indexer is ALWAYS called:
+topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
+index_mask += mask
+scores += index_mask.unsqueeze(2)
+```
+
+**Indexer Implementation** (official):
+1. Projects query via `wq_b` from compressed `qr` input
+2. Projects key via `wk` + `k_norm` from hidden states `x`
+3. RoPE applied with `interleaved=False` (non-interleaved)
+4. Hadamard transform via `rotate_activation()`
+5. FP8 quantization + `fp8_index` kernel for scoring
+6. Returns `topk_indices` shape `[batch, seq_len, min(index_topk, seq_len)]`
+
+**RoPE Difference**:
+| Aspect | Official | HF Fork |
+|--------|----------|---------|
+| Format | `freqs_cis` (complex tensor) | `(cos, sin)` tuple |
+| Function | `apply_rotary_emb(x, freqs_cis, interleaved)` | `apply_rotary_pos_emb_interleave` |
+| Indexer RoPE | `interleaved=False` | Should match |
+
+---
+
+## Latest Status (2024-12-14)
+
+### Test Results (All 6 Prompts)
+
+**Test Date:** 2024-12-14
+**Test Config:** `--use-sparse --max-tokens 200`
+
+| Prompt | Name | Tokens | Status | Notes |
+|--------|------|--------|--------|-------|
+| 0 | simple_math | 11 | ❌ **FAIL** | Echoes "What is 2+2?" instead of answering |
+| 1 | greeting | 10 | ✅ **PASS** | "Hello! I'm doing well..." (semantically equivalent) |
+| 2 | code_generation | 16 | ✅ **PASS** | Correct `is_prime` function with docstring |
+| 3 | explanation | 13 | ✅ **PASS** | Excellent relativity explanation |
+| 4 | long_context | 189 | ✅ **PASS** | Correctly lists 3 ML categories |
+| 5 | sparse_trigger | 2251 | ❌ **OOM** | CUDA OOM at softmax (line 730) |
+
+**Summary:** 4/6 semantically equivalent, 2 failures
+
+### Known Issues
+
+1. **Prompt 0 Echo Bug**: Short prompts (< ~15 tokens) echo input instead of answering
+   - Affects: `simple_math` (11 tokens)
+   - Does NOT affect: `greeting` (10 tokens) - works fine
+   - Hypothesis: Something specific to question-like prompts
+
+2. **Prompt 5 OOM**: Sparse attention triggers correctly (seq_len 2251 > index_topk 2048) but then runs out of memory
+   - Error location: `modeling_deepseek_v32.py:730` in `F.softmax(attn_weights, ...)`
+   - The full attention matrix is still being computed instead of sparse selection
+   - Needs investigation: Is the indexer output being used correctly?
+
+---
 
 ### ✅ Installation Method (Correct Way)
 

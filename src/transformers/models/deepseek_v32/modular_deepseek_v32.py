@@ -792,24 +792,63 @@ class DeepseekV32Attention(DeepseekV3Attention):
         # Expand for heads: [B, H, S, S]
         sparse_mask = sparse_mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
 
-        # Eager attention computation (matching official DeepSeek code - no flash attention)
-        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
-        attn_weights = attn_weights + sparse_mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # Memory-efficient chunked attention to avoid OOM on long sequences
+        # For seq_len=2251 with 128 heads, full attention would need ~2.6GB in float32
+        # Chunking reduces peak memory to chunk_size * kv_seq_len per head
+        chunk_size = 256  # Process 256 query positions at a time
 
-        # Compute KL target if requested (before dropout!)
-        # Per tech report: "sum across all attention heads, then L1-normalize"
-        if output_indexer_kl_target:
-            # attn_weights: [B, H, S_q, S_k] - post-softmax attention
-            # Sum across heads: [B, S_q, S_k]
-            attn_sum = attn_weights.sum(dim=1)
-            # L1 normalize along key dimension to get target distribution p_{t,:}
-            indexer_kl_target = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + 1e-10)
-            # Detach - target should not receive gradients
-            indexer_kl_target = indexer_kl_target.detach()
+        if seq_length > chunk_size:
+            # Chunked attention for memory efficiency
+            attn_outputs = []
+            attn_weights_list = [] if output_indexer_kl_target else None
 
-        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+            for chunk_start in range(0, seq_length, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, seq_length)
+
+                # Get chunk of queries and sparse mask
+                q_chunk = query_states[:, :, chunk_start:chunk_end, :]  # [B, H, chunk, D]
+                mask_chunk = sparse_mask[:, :, chunk_start:chunk_end, :]  # [B, H, chunk, kv_len]
+
+                # Compute attention for this chunk
+                chunk_attn = torch.matmul(q_chunk, key_states.transpose(-1, -2)) * self.scaling
+                chunk_attn = chunk_attn + mask_chunk
+                chunk_attn = F.softmax(chunk_attn, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+                if output_indexer_kl_target:
+                    attn_weights_list.append(chunk_attn)
+
+                chunk_attn = F.dropout(chunk_attn, p=self.attention_dropout, training=self.training)
+                chunk_output = torch.matmul(chunk_attn, value_states)
+                attn_outputs.append(chunk_output)
+
+            # Concatenate all chunks
+            attn_output = torch.cat(attn_outputs, dim=2)  # [B, H, S, D_v]
+
+            # Compute KL target if requested
+            if output_indexer_kl_target:
+                attn_weights = torch.cat(attn_weights_list, dim=2)  # [B, H, S, kv_len]
+                attn_sum = attn_weights.sum(dim=1)
+                indexer_kl_target = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + 1e-10)
+                indexer_kl_target = indexer_kl_target.detach()
+        else:
+            # Standard attention for short sequences (no chunking needed)
+            attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
+            attn_weights = attn_weights + sparse_mask
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+            # Compute KL target if requested (before dropout!)
+            # Per tech report: "sum across all attention heads, then L1-normalize"
+            if output_indexer_kl_target:
+                # attn_weights: [B, H, S_q, S_k] - post-softmax attention
+                # Sum across heads: [B, S_q, S_k]
+                attn_sum = attn_weights.sum(dim=1)
+                # L1 normalize along key dimension to get target distribution p_{t,:}
+                indexer_kl_target = attn_sum / (attn_sum.sum(dim=-1, keepdim=True) + 1e-10)
+                # Detach - target should not receive gradients
+                indexer_kl_target = indexer_kl_target.detach()
+
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
