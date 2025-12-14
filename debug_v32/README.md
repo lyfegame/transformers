@@ -113,19 +113,57 @@ Results from `/tmp/comparison.log` and `/tmp/prompt5_test.log`:
 
 **Next:** Investigate attention computation with sparse mask
 
-#### Iteration 1: Regenerated from Modular (HF Style)
+#### Iteration 1: Regenerated from Modular (Baseline)
 
 **Date:** 2024-12-14
 **Commit:** `240901cc9c` - "Iteration 1: Regenerate modeling from modular for baseline test"
-**Status:** 🔄 TESTING IN PROGRESS
+**Status:** ❌ FAILED - NameError crash
 
 **Changes from Iteration 0:**
 - Regenerated `modeling_deepseek_v32.py` from `modular_deepseek_v32.py`
 - Uses HF-style `(cos, sin)` tuple instead of `freqs_cis` (complex)
 - Uses `apply_rotary_pos_emb` instead of custom `apply_rotary_emb`
-- Full HF integration (FlashAttentionKwargs, GradientCheckpointingLayer, etc.)
 
-**Test:** Running on cluster, check `/tmp/iteration1_test.log`
+**Results:**
+| Prompt | Token Match | Logits Cosine | Error |
+|--------|-------------|---------------|-------|
+| 0 | ❌ | 0.931 | Tokens mismatch |
+| 1-5 | - | - | Crash during generation |
+
+**Error:**
+```
+NameError: name 'DeepseekV3Attention' is not defined. Did you mean: 'DeepseekV32Attention'?
+  File "modeling_deepseek_v32.py", line 620
+    attn_output, attn_weights = DeepseekV3Attention.forward(
+```
+
+**Root Cause:** The modular file calls `DeepseekV3Attention.forward(self, ...)` which works in modular context (class is imported), but breaks in generated standalone file where `DeepseekV3Attention` is not defined.
+
+---
+
+#### Fix 1: Replace DeepseekV3Attention.forward with super().forward
+
+**Date:** 2024-12-14
+**Commit:** `2832e50657` - "Fix 1: Replace DeepseekV3Attention.forward with super().forward"
+**Status:** 🔄 TESTING IN PROGRESS
+
+**Change Made (modular_deepseek_v32.py line 686):**
+```python
+# BEFORE (broken in standalone):
+attn_output, attn_weights = DeepseekV3Attention.forward(
+    self,
+    hidden_states=hidden_states,
+    ...
+)
+
+# AFTER (works in both modular and standalone):
+attn_output, attn_weights = super().forward(
+    hidden_states=hidden_states,
+    ...
+)
+```
+
+**Test:** Running on cluster, check `/tmp/fix1_test.log`
 
 **Results:** _(pending)_
 

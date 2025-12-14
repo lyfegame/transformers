@@ -615,17 +615,20 @@ class DeepseekV32Attention(nn.Module):
             and (output_indexer_scores or output_indexer_kl_target)
         )
 
-        # If not using sparse attention and don't need warm-up KL, use parent path
+        # If not using sparse attention and don't need warm-up KL, use dense path
+        # Note: We use _forward_dense_warmup with indexer outputs disabled for
+        # compatibility with standalone generated code (where parent class is nn.Module)
         if not use_sparse and not need_warmup_kl:
-            attn_output, attn_weights = super().forward(
+            return self._forward_dense_warmup(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
+                output_indexer_scores=False,
+                output_indexer_kl_target=False,
                 **kwargs,
             )
-            return attn_output, attn_weights, None, None
 
         # Dense warm-up path: compute dense attention but also indexer outputs
         # This is used when use_sparse_attention=False but indexer_kl_coef > 0
