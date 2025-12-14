@@ -227,30 +227,32 @@ Generation produced gibberish ("whatwhatwhat..."). REVERTED to Fix 2.
 
 ---
 
-### 🧪 Latest Test: 6-Prompt Semantic Comparison (2024-12-14)
+### 🧪 Latest Test: Fork Code with trust_remote_code=False (2024-12-14)
 
 **Date:** 2024-12-14
 **Branch:** `shuyingl/deepseek-v32-minimal-on-v4.57.3`
 **Transformers version:** 4.57.3
-**Test:** Generate 100 tokens per prompt with `--use-sparse` enabled
+**Test:** Generate 200 tokens per prompt with `--use-sparse` enabled
+**IMPORTANT:** Using `trust_remote_code=False` to test FORK code, not checkpoint code!
 
 **Installation command on cluster:**
 ```bash
-pip install --quiet git+https://github.com/lyfegame/transformers@shuyingl/deepseek-v32-minimal-on-v4.57.3
+pip install --force-reinstall git+https://github.com/lyfegame/transformers@shuyingl/deepseek-v32-minimal-on-v4.57.3
 ```
 
 **Results:**
 
-| Prompt | Name | Token Count | Semantic Result | Notes |
-|--------|------|-------------|-----------------|-------|
-| 0 | simple_math | 11 | ❌ **FAILED** | Echoed input "What is 2+2?" instead of answering "4" |
-| 1 | greeting | 10 | ✅ **PASSED** | "Hello! I'm doing well, thank you for asking. How are you today? Is there anything I can help you with?" |
-| 2 | code_generation | 16 | ✅ **PASSED** | Generated correct `is_prime(n)` function with proper algorithm |
-| 3 | explanation | 13 | ✅ **PASSED** | Good explanation of relativity: "Einstein's theory is about space, time, and gravity..." |
-| 4 | long_context | 189 | ⚠️ **UNCLEAR** | Generated empty/truncated response |
-| 5 | sparse_trigger | 2250 | ❌ **ERROR** | FileNotFoundError: missing prompt file on cluster |
+| Prompt | Name | Input Tokens | Generated Tokens | Semantic Result | Notes |
+|--------|------|--------------|------------------|-----------------|-------|
+| 0 | simple_math | 11 | 9 | ❌ **FAILED** | Echoed input "What is 2+2?" instead of answering "4" |
+| 1 | greeting | 10 | 27 | ✅ **PASSED** | "Hello! I'm doing well, thank you for asking. How are you today?" |
+| 2 | code_generation | 16 | 200 | ✅ **PASSED** | Generated correct `is_prime(n)` function with explanation |
+| 3 | explanation | 13 | 200 | ✅ **PASSED** | Good relativity explanation: "Einstein's theory is about space, time, and gravity..." |
+| 4 | long_context | 189 | 1 | ❌ **FAILED** | Only generated 1 token (empty) - should have answered ML categories |
 
-**Summary:** 3/5 prompts passed semantically (prompts 1, 2, 3). The simple_math echo issue persists.
+**Summary:** 3/5 prompts passed semantically (prompts 1, 2, 3). Two failures:
+- **Prompt 0**: Echoes input instead of answering (very short prompt issue)
+- **Prompt 4**: Generates only 1 empty token (longer context issue)
 
 **Detailed Outputs:**
 
@@ -290,15 +292,28 @@ Both provide good explanations of relativity - semantically equivalent
 ```
 
 **Analysis:**
-- The model generates coherent, semantically correct responses for most prompts
-- The simple_math echo issue (prompt 0) persists - may be tokenization or very short prompt handling
-- Long context (prompt 4) needs investigation - empty response suggests issue with longer sequences
-- Overall: **Model works reasonably well** with the current branch for typical use cases
+- The model generates coherent, semantically correct responses for most prompts (1, 2, 3)
+- The simple_math echo issue (prompt 0) persists - generates input echo instead of answer
+- Long context (prompt 4) only generates 1 empty token - hitting EOS prematurely?
+- Overall: **Model works reasonably well** for typical use cases but has generation issues
 
-**Next Steps:**
-1. Investigate simple_math echo issue (prompt 0) - possibly tokenization related
-2. Fix sparse_trigger test by ensuring prompt file exists on cluster
-3. Investigate long_context empty response
+**Known Issues to Investigate:**
+1. **Prompt 0 echo**: Very short prompts (11 tokens) echo input instead of answering
+2. **Prompt 4 empty**: Longer context (189 tokens) generates only 1 token
+3. Both failures suggest premature EOS or generation logic issues
+
+**Modular File Status:**
+The modular file properly inherits from V3 (Occam's razor):
+```
+DeepseekV32RMSNorm(DeepseekV3RMSNorm)       # Pass-through
+DeepseekV32RotaryEmbedding(DeepseekV3RotaryEmbedding)  # Pass-through
+DeepseekV32Config(DeepseekV3Config)         # Adds indexer params
+DeepseekV32Indexer(nn.Module)               # NEW - V3.2 specific
+DeepseekV32Attention(DeepseekV3Attention)   # Adds sparse attention
+DeepseekV32DecoderLayer(DeepseekV3DecoderLayer)
+DeepseekV32Model(DeepseekV3Model)
+DeepseekV32ForCausalLM(DeepseekV3ForCausalLM)
+```
 
 ---
 
