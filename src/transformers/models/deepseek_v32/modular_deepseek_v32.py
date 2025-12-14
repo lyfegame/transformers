@@ -736,11 +736,12 @@ class DeepseekV32Attention(DeepseekV3Attention):
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-        # Apply RoPE
-        # NOTE: Using standard apply_rotary_pos_emb - the interleave version has a
-        # conversion that may be incorrect for DeepSeek checkpoint format
+        # Apply RoPE (INTERLEAVED for MLA)
         cos, sin = position_embeddings
-        q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+        if self.config.rope_interleave:
+            q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
+        else:
+            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
 
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -863,11 +864,12 @@ class DeepseekV32Attention(DeepseekV3Attention):
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 
-        # Apply RoPE
-        # NOTE: Using standard apply_rotary_pos_emb - the interleave version has a
-        # conversion that may be incorrect for DeepSeek checkpoint format
+        # Apply RoPE (INTERLEAVED for MLA)
         cos, sin = position_embeddings
-        q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+        if self.config.rope_interleave:
+            q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
+        else:
+            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
 
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
