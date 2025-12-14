@@ -615,10 +615,9 @@ class DeepseekV32Attention(nn.Module):
             and (output_indexer_scores or output_indexer_kl_target)
         )
 
-        # If not using sparse attention and don't need warm-up KL, use V3 path
+        # If not using sparse attention and don't need warm-up KL, use parent path
         if not use_sparse and not need_warmup_kl:
-            attn_output, attn_weights = DeepseekV3Attention.forward(
-                self,
+            attn_output, attn_weights = super().forward(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,

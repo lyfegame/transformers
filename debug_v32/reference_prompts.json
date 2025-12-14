@@ -1,0 +1,62 @@
+{
+  "description": "Reference prompts and expected outputs for DeepSeek V3.2 debugging",
+  "settings": {
+    "temperature": 0.0,
+    "max_new_tokens": 200
+  },
+  "prompts": [
+    {
+      "id": 0,
+      "name": "simple_math",
+      "directory": "prompt_0_simple_math",
+      "prompt": "What is 2+2?",
+      "expected_output": "2 + 2 = 4",
+      "notes": "Basic arithmetic, tests core model functionality"
+    },
+    {
+      "id": 1,
+      "name": "greeting",
+      "directory": "prompt_1_greeting",
+      "prompt": "Hello, how are you?",
+      "expected_output": "Hello! I'm doing well, thank you for asking! How are you today? Is there anything I can help you with?",
+      "notes": "Conversational, tests chat format"
+    },
+    {
+      "id": 2,
+      "name": "code_generation",
+      "directory": "prompt_2_code_generation",
+      "prompt": "Write a Python function to check if a number is prime.",
+      "expected_output": "def is_prime(n):\n    if n <= 1:\n        return False\n    if n <= 3:\n        return True\n    if n % 2 == 0 or n % 3 == 0:\n        return False\n    i = 5\n    while i * i <= n:\n        if n % i == 0 or n % (i + 2) == 0:\n            return False\n        i += 6\n    return True",
+      "notes": "Code generation, tests reasoning"
+    },
+    {
+      "id": 3,
+      "name": "explanation",
+      "directory": "prompt_3_explanation",
+      "prompt": "Explain the theory of relativity in simple terms.",
+      "expected_output": "At its heart, relativity is about understanding how space, time, gravity, and motion are all connected...",
+      "notes": "Long-form explanation, tests coherent generation"
+    },
+    {
+      "id": 4,
+      "name": "long_context",
+      "directory": "prompt_4_long_context",
+      "prompt": "The following is a long document about machine learning. Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed. It focuses on developing computer programs that can access data and use it to learn for themselves. The process begins with observations or data, such as examples, direct experience, or instruction, to look for patterns in data and make better decisions in the future. The primary aim is to allow computers to learn automatically without human intervention. Machine learning algorithms are often categorized into three main types: supervised learning, unsupervised learning, and reinforcement learning. Supervised learning uses labeled datasets to train algorithms to classify data or predict outcomes accurately. Unsupervised learning analyzes and clusters unlabeled datasets to discover hidden patterns without human intervention. Reinforcement learning trains algorithms through a system of reward and punishment, learning to take actions that maximize rewards.\n\nQuestion: What are the three main categories of machine learning algorithms?",
+      "expected_output": "Based on the document provided, the three main categories of machine learning algorithms are:\n1. Supervised learning\n2. Unsupervised learning\n3. Reinforcement learning",
+      "notes": "Long context (~200 tokens), tests sparse attention if seq_len > index_topk"
+    },
+    {
+      "id": 5,
+      "name": "sparse_trigger",
+      "directory": "prompt_5_sparse_trigger",
+      "prompt_file": "long_prompt_sparse.txt",
+      "expected_output": "Based on the document, the three main techniques DeepSeek V3.2 uses to achieve efficient inference on long sequences are:\n\n1.  **Multi-head Latent Attention (MLA):** This compresses the key-value cache using low-rank projections, dramatically reducing its memory footprint during inference. This is crucial for long sequences where the standard KV cache would become prohibitively large.\n\n2.  **Lightning Indexer:** This is a learned sparse attention mechanism. Instead of using the quadratic-cost full attention, it dynamically selects the top-k most relevant tokens for each query to attend to. This reduces the computational complexity from quadratic to linear with respect to sequence length.\n\n3.  **Rotary Position Embeddings (RoPE) with extensions:** RoPE provides better length generalization than fixed or learned positional embeddings. The document mentions DeepSeek V3 employs a tuned variant of RoPE, and recent techniques like position interpolation or YaRN (hinted at in the context of extending RoPE) allow the model to effectively handle context lengths exceeding 128,000 tokens by enabling extrapolation to positions not seen during training.\n\n**In summary:** MLA reduces the **memory bottleneck** of the KV cache, the Lightning Indexer reduces the **computational bottleneck** of attention scoring, and advanced RoPE enables effective **generalization to very long sequences**.",
+      "notes": "Very long context (2250 tokens), ACTUALLY triggers sparse attention since seq_len (2250) > index_topk (2048). topk_indices shape: [1, 2250, 2048]"
+    }
+  ],
+  "cluster_paths": {
+    "base_output_dir": "/mnt/models-disk/official_tensors",
+    "checkpoint": "/models-local/DeepSeek-V3.2-converted-mp8",
+    "config": "config_671B_v3.2.json"
+  }
+}
