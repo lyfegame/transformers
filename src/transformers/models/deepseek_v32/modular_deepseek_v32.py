@@ -407,7 +407,7 @@ class DeepseekV32Indexer(nn.Module):
             output_scores: If True, also return the raw index scores
 
         Returns:
-            topk_indices: Indices of selected tokens [batch, seq_len, topk]
+            topk_indices: Indices of selected tokens [batch, seq_len, index_topk] (padded to fixed size)
             index_scores: (optional) Raw index scores [batch, seq_len, seq_len] if output_scores=True
         """
         import os
@@ -529,9 +529,21 @@ class DeepseekV32Indexer(nn.Module):
                     logger.warning(f"  mask[0,-1,:]: {attention_mask[0, -1, -5:].tolist()}... (last query, last 5 keys)")
             index_scores = index_scores + attention_mask
 
-        # Select top-k tokens
+        # Select top-k tokens from current context
+        # k_select is the actual number we can select (limited by seq_len)
         k_select = min(self.index_topk, seq_len)
-        topk_indices = index_scores.topk(k_select, dim=-1).indices  # [B, S, topk]
+        topk_indices = index_scores.topk(k_select, dim=-1).indices  # [B, S, k_select]
+
+        # Pad to fixed index_topk size for consistent output shape
+        # This ensures output is always [B, S, index_topk] regardless of seq_len
+        if k_select < self.index_topk:
+            pad_size = self.index_topk - k_select
+            pad_indices = torch.zeros(
+                (batch_size, seq_len, pad_size),
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+            topk_indices = torch.cat([topk_indices, pad_indices], dim=-1)  # [B, S, index_topk]
 
         if DEBUG_INDEXER and self.layer_idx == 0:
             logger.warning(f"[Indexer L{self.layer_idx}] === TOP-K SELECTION ===")
@@ -772,6 +784,7 @@ class DeepseekV32Attention(DeepseekV3Attention):
             topk_indices, indexer_scores = indexer_result
         else:
             topk_indices = indexer_result
+            indexer_scores = None
 
         # Create sparse attention mask (matching official DeepSeek implementation)
         # topk_indices: [B, S, topk] -> sparse_mask: [B, S, kv_seq_len]

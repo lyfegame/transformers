@@ -286,9 +286,7 @@ class DeepseekV32Indexer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         output_scores: bool = False,
-        cached_indexer_keys: Optional[torch.Tensor] = None,
-        kv_seq_len: Optional[int] = None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Compute top-k token indices for sparse attention.
 
@@ -298,13 +296,10 @@ class DeepseekV32Indexer(nn.Module):
             position_embeddings: Tuple of (cos, sin) for RoPE
             attention_mask: Optional attention mask
             output_scores: If True, also return the raw index scores
-            cached_indexer_keys: Cached indexer keys from previous tokens [batch, cached_len, head_dim]
-            kv_seq_len: Total KV sequence length (for generation with cache)
 
         Returns:
-            topk_indices: Indices of selected tokens [batch, seq_len, topk]
-            index_scores: (optional) Raw index scores [batch, seq_len, kv_seq_len] if output_scores=True
-            current_indexer_keys: Keys for current tokens [batch, seq_len, head_dim] for caching
+            topk_indices: Indices of selected tokens [batch, seq_len, index_topk] (padded to fixed size)
+            index_scores: (optional) Raw index scores [batch, seq_len, seq_len] if output_scores=True
         """
         import os
 
@@ -362,27 +357,13 @@ class DeepseekV32Indexer(nn.Module):
         q = _hadamard_transform(q)
         k = _hadamard_transform(k)
 
-        # Store current keys before concatenation (for caching)
-        current_indexer_keys = k  # [B, S, D]
-
-        # Concatenate with cached keys if provided (for generation with KV cache)
-        if cached_indexer_keys is not None:
-            k = torch.cat([cached_indexer_keys, k], dim=1)  # [B, cached_len + S, D]
-
-        # Determine effective key sequence length for top-k selection
-        effective_kv_len = k.shape[1]
-        if kv_seq_len is not None:
-            effective_kv_len = kv_seq_len
-
         if DEBUG_INDEXER and self.layer_idx == 0:
             logger.warning(f"[Indexer L{self.layer_idx}] === AFTER HADAMARD ===")
             logger.warning(f"  q: {q.shape}, mean={q.mean().item():.4f}, std={q.std().item():.4f}")
             logger.warning(f"  k: {k.shape}, mean={k.mean().item():.4f}, std={k.std().item():.4f}")
-            logger.warning(f"  cached_indexer_keys: {cached_indexer_keys.shape if cached_indexer_keys is not None else None}")
-            logger.warning(f"  effective_kv_len: {effective_kv_len}")
 
         # Compute index scores: I_{t,s} = sum_j w_{t,j} * ReLU(q_{t,j} * k_s)
-        # q: [B, S, H, D], k: [B, kv_len, D]
+        # q: [B, S, H, D], k: [B, S, D]
         # First compute q * k for all pairs: [B, S_q, H, S_k]
         q = q.transpose(1, 2)  # [B, H, S_q, D]
         k = k.unsqueeze(1)  # [B, 1, S_k, D]
@@ -448,12 +429,13 @@ class DeepseekV32Indexer(nn.Module):
                     )
             index_scores = index_scores + attention_mask
 
-        # Select top-k tokens from the FULL key sequence (including cached)
-        k_select = min(self.index_topk, effective_kv_len)
+        # Select top-k tokens from current context
+        # k_select is the actual number we can select (limited by seq_len)
+        k_select = min(self.index_topk, seq_len)
         topk_indices = index_scores.topk(k_select, dim=-1).indices  # [B, S, k_select]
 
-        # Pad to fixed index_topk size if needed (official implementation uses fixed size)
-        # Pad with zeros (index 0) for positions beyond actual sequence length
+        # Pad to fixed index_topk size for consistent output shape
+        # This ensures output is always [B, S, index_topk] regardless of seq_len
         if k_select < self.index_topk:
             pad_size = self.index_topk - k_select
             pad_indices = torch.zeros(
@@ -465,17 +447,16 @@ class DeepseekV32Indexer(nn.Module):
 
         if DEBUG_INDEXER and self.layer_idx == 0:
             logger.warning(f"[Indexer L{self.layer_idx}] === TOP-K SELECTION ===")
-            logger.warning(f"  k_select: {k_select}, index_topk: {self.index_topk}, effective_kv_len: {effective_kv_len}")
+            logger.warning(f"  k_select: {k_select}, index_topk: {self.index_topk}, seq_len: {seq_len}")
             logger.warning(f"  topk_indices: {topk_indices.shape}")
             # Show which tokens are selected for first and last query position
             logger.warning(f"  topk for query[0] (first token): {topk_indices[0, 0, :10].tolist()}...")
             if seq_len > 1:
                 logger.warning(f"  topk for query[-1] (last token): {topk_indices[0, -1, :10].tolist()}...")
 
-        # Always return current_indexer_keys for caching
         if output_scores:
-            return topk_indices, index_scores, current_indexer_keys
-        return topk_indices, current_indexer_keys
+            return topk_indices, index_scores
+        return topk_indices
 
 
 def apply_rotary_pos_emb_interleave(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -589,8 +570,6 @@ class DeepseekV32Attention(nn.Module):
                 self.scaling = self.scaling * mscale * mscale
         # Add the Lightning Indexer (only new component vs V3)
         self.indexer = DeepseekV32Indexer(config, layer_idx)
-        # Cache for indexer keys (needed for generation with sparse attention)
-        self._cached_indexer_keys: Optional[torch.Tensor] = None
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -631,10 +610,6 @@ class DeepseekV32Attention(nn.Module):
         batch_size, seq_length = hidden_states.shape[:-1]
         indexer_scores = None
         indexer_kl_target = None
-
-        # Clear indexer cache when starting new generation (no past_key_values)
-        if past_key_values is None:
-            self._cached_indexer_keys = None
 
         # Determine if we should use sparse attention
         # Sparse attention applies during prefill (seq_length > 1) and decode with KV cache
@@ -727,14 +702,6 @@ class DeepseekV32Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # Get KV sequence length (after cache update)
-        kv_seq_len = key_states.shape[2]
-
-        # Get cached indexer keys if we're in generation mode (past_key_values exists)
-        cached_indexer_keys = None
-        if past_key_values is not None and self._cached_indexer_keys is not None:
-            cached_indexer_keys = self._cached_indexer_keys
-
         # Get top-k indices from the indexer (optionally with scores)
         need_scores = output_indexer_scores or output_indexer_kl_target
         indexer_result = self.indexer(
@@ -743,22 +710,13 @@ class DeepseekV32Attention(nn.Module):
             position_embeddings,
             attention_mask,
             output_scores=need_scores,
-            cached_indexer_keys=cached_indexer_keys,
-            kv_seq_len=kv_seq_len,
         )
 
         if need_scores:
-            topk_indices, indexer_scores, current_indexer_keys = indexer_result
+            topk_indices, indexer_scores = indexer_result
         else:
-            topk_indices, current_indexer_keys = indexer_result
+            topk_indices = indexer_result
             indexer_scores = None
-
-        # Update indexer key cache
-        if past_key_values is not None:
-            if self._cached_indexer_keys is None:
-                self._cached_indexer_keys = current_indexer_keys
-            else:
-                self._cached_indexer_keys = torch.cat([self._cached_indexer_keys, current_indexer_keys], dim=1)
 
         # Create sparse attention mask (matching official DeepSeek implementation)
         # topk_indices: [B, S, topk] -> sparse_mask: [B, S, kv_seq_len]
@@ -913,10 +871,9 @@ class DeepseekV32Attention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # Compute indexer scores (needed for KL loss)
-        # Note: During dense warmup, we don't use KV cache, so no cached indexer keys
         indexer_scores = None
         if output_indexer_scores or output_indexer_kl_target:
-            _, indexer_scores, _ = self.indexer(
+            _, indexer_scores = self.indexer(
                 hidden_states,
                 q_compressed_for_indexer,
                 position_embeddings,
