@@ -613,9 +613,9 @@ class DeepseekV32Attention(DeepseekV3Attention):
 
     Key differences from V3:
     - Adds Lightning Indexer for token selection
-    - Supports sparse attention mask during prefill
+    - Supports sparse attention mask during prefill and decode (with KV cache)
+    - During decode, indexer selects top-k cached KV positions for efficiency
     - Falls back to dense attention (V3 behavior) when use_sparse_attention=False
-      or during decode (seq_len=1)
 
     Note: Sparse attention uses eager computation (matching official DeepSeek code).
     When sparse attention is disabled, flash attention and other backends are supported.
@@ -640,9 +640,11 @@ class DeepseekV32Attention(DeepseekV3Attention):
         """
         Forward pass with sparse attention via Lightning Indexer.
 
-        The sparse attention is only applied during prefill (seq_len > 1) when
-        use_sparse_attention=True. During decode or when sparse attention is
-        disabled, this behaves identically to DeepseekV3Attention.
+        Sparse attention is applied during prefill (seq_len > 1) and decode
+        (with KV cache) when use_sparse_attention=True. During decode, the
+        indexer selects top-k cached KV positions for each query token.
+        When sparse attention is disabled, this behaves identically to
+        DeepseekV3Attention.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_size]
@@ -664,11 +666,12 @@ class DeepseekV32Attention(DeepseekV3Attention):
         indexer_kl_target = None
 
         # Determine if we should use sparse attention
-        # Sparse attention only applies during prefill, not decode
+        # Sparse attention applies during prefill (seq_length > 1) and decode with KV cache
+        # During decode, the indexer selects top-k cached KV positions for efficiency
         use_sparse = (
             self.config.use_sparse_attention
             and self.q_lora_rank is not None  # Need compressed queries for indexer
-            and seq_length > 1  # Only for prefill, not decode
+            and (seq_length > 1 or past_key_values is not None)  # Prefill OR decode with cache
         )
 
         # Check if we need indexer outputs for warm-up training
