@@ -450,7 +450,18 @@ class DeepseekV32Indexer(nn.Module):
 
         # Select top-k tokens from the FULL key sequence (including cached)
         k_select = min(self.index_topk, effective_kv_len)
-        topk_indices = index_scores.topk(k_select, dim=-1).indices  # [B, S, topk]
+        topk_indices = index_scores.topk(k_select, dim=-1).indices  # [B, S, k_select]
+
+        # Pad to fixed index_topk size if needed (official implementation uses fixed size)
+        # Pad with zeros (index 0) for positions beyond actual sequence length
+        if k_select < self.index_topk:
+            pad_size = self.index_topk - k_select
+            pad_indices = torch.zeros(
+                (batch_size, seq_len, pad_size),
+                dtype=topk_indices.dtype,
+                device=topk_indices.device,
+            )
+            topk_indices = torch.cat([topk_indices, pad_indices], dim=-1)  # [B, S, index_topk]
 
         if DEBUG_INDEXER and self.layer_idx == 0:
             logger.warning(f"[Indexer L{self.layer_idx}] === TOP-K SELECTION ===")
