@@ -408,8 +408,25 @@ class DeepseekV32Indexer(nn.Module):
                 f"mean={index_scores.mean().item():.4f}"
             )
 
-        # Apply attention mask if provided
-        if attention_mask is not None:
+        # Apply attention mask - CRITICAL for causal attention
+        # When using SDPA, the mask may be None (causality handled by is_causal flag),
+        # but the indexer needs an explicit causal mask to prevent selecting future tokens
+        if attention_mask is None:
+            # Create causal mask: query position t can only attend to positions 0..t
+            # Shape: [1, seq_len, seq_len], broadcast across batch
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=hidden_states.device, dtype=index_scores.dtype),
+                diagonal=1,
+            )
+            causal_mask = causal_mask.unsqueeze(0)  # [1, S, S]
+            if DEBUG_INDEXER and self.layer_idx == 0:
+                logger.warning(f"[Indexer L{self.layer_idx}] === CREATED CAUSAL MASK ===")
+                logger.warning(f"  causal_mask shape: {causal_mask.shape}")
+                logger.warning(f"  causal_mask[0,0,:5]: {causal_mask[0, 0, :5].tolist()}")
+                logger.warning(f"  causal_mask[0,-1,-5:]: {causal_mask[0, -1, -5:].tolist()}")
+            index_scores = index_scores + causal_mask
+        else:
+            # Use provided attention mask
             # attention_mask is typically [B, 1, S_q, S_k] or [B, S_q, S_k]
             if attention_mask.dim() == 4:
                 attention_mask = attention_mask.squeeze(1)
